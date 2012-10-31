@@ -35,6 +35,7 @@ type config struct {
 	IntervalNS	int64	`json:"interval_ns"`
 	MaxLogSize	int64	`json:"max_logsize`
 	Uids		[]uint32`json:"uids"`
+	ImageSuffixs	[]string`json:"image_suffixs"`
 	Follow		bool	`json:"follow"`
 	Save		bool	`json:"save"`
 	DebugLevel	int	`json:"debug_level"`
@@ -76,6 +77,7 @@ func main() {
 		sleep(now, last, conf.IntervalNS)
 		last = now
 
+		// assume isPrefix nerver be true
 		b, _, err := reader.ReadLine()
 		line = append(line, b...)
 
@@ -94,7 +96,7 @@ func main() {
 				conf.Off = 0
 				conf.LogIndex = getLogIndex(newFile.Name())
 				conf.RW.Unlock()
-				log.Debug("reOpen ", newFile.Name())
+				log.Info("reOpen ", newFile.Name())
 			}
 			logFile.Close()
 			logFile = newFile
@@ -106,7 +108,7 @@ func main() {
 
 		atomic.AddInt64(&conf.Off, int64(len(line)) + 1)
 
-		if uri, ok := parseLine(string(line), conf.Uids); ok {
+		if uri, ok := parseLine(string(line), conf.Uids, conf.ImageSuffixs); ok {
 			preOp(conf.IODomain, string(uri), conf.Params, conf.Save)
 		}
 
@@ -114,12 +116,13 @@ func main() {
 	}
 }
 
-func parseLine(line string, uids []uint32) (uri string, ok bool) {
+func parseLine(line string, uids []uint32, imgSuffixs []string) (uri string, ok bool) {
 
 	const (
 		RS_REQ = "REQ\tRS\t"
 		RS_PUT = "/put/"
-		CONTENT_TYPE = "\"Content-Type\":"
+		RS_INS = "/ins/"
+		MIME_TYPE = "mimeType/"
 		TOKEN_UID = "\"uid\":"
 	)
 
@@ -127,43 +130,60 @@ func parseLine(line string, uids []uint32) (uri string, ok bool) {
 		return
 	}
 
-	words := strings.SplitN(line[len(RS_REQ):], "\t", 6)
-	if len(words) < 6 {
+	words := strings.SplitN(line[len(RS_REQ):], "\t", 7)
+	if len(words) < 7 {
 		return
 	}
 
-	if words[1] != "POST" || words[4] != "200" {
+	if words[1] != "POST" || words[5] != "200" {
 		return
 	}
 
 	url := words[2]
-	if !strings.HasPrefix(url, RS_PUT) {
+	if !strings.HasPrefix(url, RS_PUT) && !strings.HasPrefix(url, RS_INS) {
 		return
 	}
 
+	// len(RS_PUT) == len(RS_INS)
+	param := ""
 	entry := url[len(RS_PUT):]
 	if i := strings.Index(entry, "/"); i >= 0 {
+		param = entry[i:]
 		entry = entry[:i]
 	}
-	log.Debug("parse entry: ", entry)
+
+	entry, err := rpc.DecodeURI(entry)
+	if err != nil {
+		log.Warn(entry, " decode fail: ", err)
+		return
+	}
+
+	mime := ""
+	if i := strings.Index(param, MIME_TYPE); i >= 0 {
+		mime = param[i+len(MIME_TYPE):]
+		if j := strings.Index(mime, "/"); j >= 0 {
+			mime = mime[:j]
+		}
+	}
+
+	mime, err = rpc.DecodeURI(mime)
+	if err != nil {
+		log.Warn(mime, "decode fail: ", err)
+		return
+	}
+
+	if !strings.HasPrefix(mime, "image/") && !hasSuffix(entry, imgSuffixs) {
+		return
+	}
 
 	header := words[3]
-	ctIdx := strings.Index(header, CONTENT_TYPE)
-	if ctIdx < 0 {
-		return
-	}
-
-	if !strings.HasPrefix(header[ctIdx + len(CONTENT_TYPE) + 1:], "\"image/") {
-		return
-	}
-
 	uidIdx := strings.Index(header, TOKEN_UID)
 	if uidIdx < 0 {
 		return
 	}
 
-	strUid := header[uidIdx + len(TOKEN_UID) + 1:]
-	if i := strings.Index(strUid, ","); i < 0 {
+	strUid := header[uidIdx + len(TOKEN_UID):]
+	if i := strings.Index(strUid, ","); i >= 0 {
 		strUid = strUid[:i]
 	}
 
@@ -172,18 +192,11 @@ func parseLine(line string, uids []uint32) (uri string, ok bool) {
 		return
 	}
 
-	log.Debug("parse uid: ", uid)
 	if !contain(uids, uint32(uid)) {
 		return
 	}
 
-	entryURI, err := rpc.DecodeURI(entry)
-	if err != nil {
-		log.Warn(entryURI, " decode fail: ", err)
-		return
-	}
-
-	uri = strings.Replace(entryURI, ":", "/", 1)
+	uri = strings.Replace(entry, ":", "/", 1)
 	return uri, true
 }
 
@@ -191,6 +204,16 @@ func contain(a []uint32, t uint32) bool {
 
 	for _, v := range a {
 		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSuffix(s string, suffixs []string) bool {
+
+	for _, v := range suffixs {
+		if strings.HasSuffix(s, v) {
 			return true
 		}
 	}
@@ -269,6 +292,8 @@ func sleep(now, last time.Time, tick int64) {
 	}
 }
 
+var successiveFail = 0
+
 func reOpen(f *os.File, maxSize int64) (nf *os.File) {
 
 	oldFi, err := f.Stat()
@@ -277,7 +302,9 @@ func reOpen(f *os.File, maxSize int64) (nf *os.File) {
 		return
 	}
 
-	if oldFi.Size() >= maxSize {
+	successiveFail++
+	if successiveFail > 100 || oldFi.Size() >= maxSize {
+		successiveFail = 0
 		return getNextLog(f.Name())
 	}
 
